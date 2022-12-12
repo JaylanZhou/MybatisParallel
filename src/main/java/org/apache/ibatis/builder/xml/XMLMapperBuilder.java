@@ -13,11 +13,10 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
-package org.ibatis.builder.xml;
+package org.apache.ibatis.builder.xml;
 
+import com.google.common.collect.Lists;
 import org.apache.ibatis.builder.*;
-import org.apache.ibatis.builder.xml.XMLMapperEntityResolver;
-import org.apache.ibatis.builder.xml.XMLStatementBuilder;
 import org.apache.ibatis.cache.Cache;
 import org.apache.ibatis.executor.ErrorContext;
 import org.apache.ibatis.io.Resources;
@@ -28,14 +27,13 @@ import org.apache.ibatis.reflection.MetaClass;
 import org.apache.ibatis.session.Configuration;
 import org.apache.ibatis.type.JdbcType;
 import org.apache.ibatis.type.TypeHandler;
-import org.ibatis.constants.MybatisBootStrapConstant;
+import org.apache.ibatis.constants.MybatisBootStrapConstant;
 
 import java.io.InputStream;
 import java.io.Reader;
 import java.util.*;
-import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
+
 
 /**
  * @author Clinton Begin
@@ -43,8 +41,15 @@ import java.util.concurrent.TimeUnit;
  */
 public class XMLMapperBuilder extends BaseBuilder {
 
-  private static final ThreadPoolExecutor TEST_POOL_EXECUTOR = new ThreadPoolExecutor(10, Integer.MAX_VALUE, 5000, TimeUnit.MILLISECONDS,
-    new LinkedBlockingDeque<>(1000), Thread::new, (r, executor) -> System.out.println("拒绝策略"));
+  private static final ThreadPoolExecutor MYBATIS_PARALLEL_EXECUTOR = new ThreadPoolExecutor(10, Integer.MAX_VALUE, 5000, TimeUnit.MILLISECONDS,
+          new LinkedBlockingDeque<>(1000), Thread::new, (r, executor) -> System.out.println("拒绝策略"));
+
+  private static final List<Future<Object>> MYBATIS_PARALLEL_TASK = Lists.newArrayList();
+
+  private static boolean isCurrentDataSourceInitSuccess = false;
+
+  private static final Object INIT_CURRENT_DATASOURCE_LOCK = new Object();
+
   private final XPathParser parser;
   private final MapperBuilderAssistant builderAssistant;
   private final Map<String, XNode> sqlFragments;
@@ -83,18 +88,36 @@ public class XMLMapperBuilder extends BaseBuilder {
   public void parse() {
 
     if (MybatisBootStrapConstant.IS_USE_PARALLEL_MYBATIS_PARSE) {
-      TEST_POOL_EXECUTOR.execute(new Runnable() {
-        @Override
-        public void run() {
-          synchronized (resource) {
-            if (!configuration.isResourceLoaded(resource)) {
-              configurationElement(parser.evalNode("/mapper"));
-              configuration.addLoadedResource(resource);
-              bindMapperForNamespace();
+      if (resource.endsWith("_" + builderAssistant.getConfiguration().getDatabaseId() + ".xml]")) {
+        Future<Object> subTask = MYBATIS_PARALLEL_EXECUTOR.submit(new Callable<Object>() {
+          @Override
+          public Object call() {
+            synchronized (resource) {
+              if (!configuration.isResourceLoaded(resource)) {
+                configurationElement(parser.evalNode("/mapper"));
+                configuration.addLoadedResource(resource);
+                bindMapperForNamespace();
+              }
+            }
+            return null;
+          }
+        });
+        MYBATIS_PARALLEL_TASK.add(subTask);
+      } else {
+        MYBATIS_PARALLEL_EXECUTOR.execute(new Runnable() {
+          @Override
+          public void run() {
+            waitCurrentInitSuccess();
+            synchronized (resource) {
+              if (!configuration.isResourceLoaded(resource)) {
+                configurationElement(parser.evalNode("/mapper"));
+                configuration.addLoadedResource(resource);
+                bindMapperForNamespace();
+              }
             }
           }
-        }
-      });
+        });
+      }
     } else {
       if (!configuration.isResourceLoaded(resource)) {
         configurationElement(parser.evalNode("/mapper"));
@@ -105,6 +128,32 @@ public class XMLMapperBuilder extends BaseBuilder {
         parsePendingStatements();
       }
     }
+
+  }
+
+  private void waitCurrentInitSuccess() {
+
+    if (isCurrentDataSourceInitSuccess) {
+      return;
+    }
+    synchronized (INIT_CURRENT_DATASOURCE_LOCK) {
+      if (isCurrentDataSourceInitSuccess) {
+        return;
+      }
+      if (MYBATIS_PARALLEL_TASK.isEmpty()) {
+        isCurrentDataSourceInitSuccess = true;
+        return;
+      }
+      for (Future<Object> objectFuture : MYBATIS_PARALLEL_TASK) {
+        try {
+          objectFuture.get();
+        } catch (InterruptedException | ExecutionException e) {
+          throw new RuntimeException(e);
+        }
+      }
+      isCurrentDataSourceInitSuccess = true;
+    }
+
 
   }
 

@@ -1,4 +1,4 @@
-package org.ibatis.constants;
+package org.apache.ibatis.constants;
 
 public interface MybatisBootStrapConstant {
 
